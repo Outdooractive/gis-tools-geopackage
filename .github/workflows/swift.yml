@@ -15,7 +15,7 @@ jobs:
 
     steps:
     - uses: swift-actions/setup-swift@v2
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install SQLite (Linux)
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
