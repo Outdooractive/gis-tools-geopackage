@@ -145,3 +145,17 @@ let tileTables = try await gpkg.tileTables()
 | `TEXT` | `String` |
 | `BLOB` | `String` (Base64) |
 | `BOOLEAN` | `Bool` |
+
+## Contributing
+
+Please [create an issue](https://github.com/Outdooractive/gis-tools-geopackage/issues) or [open a pull request](https://github.com/Outdooractive/gis-tools-geopackage/pulls) with a fix or enhancement.
+
+## License
+
+MIT
+
+## Authors
+
+Thomas Rasch, Outdooractive
+
+Built on top of [**gis-tools**](https://github.com/Outdooractive/gis-tools).
