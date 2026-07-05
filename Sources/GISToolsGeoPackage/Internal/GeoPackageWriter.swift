@@ -2,52 +2,6 @@ import Foundation
 import GISTools
 import CSQLite
 
-extension FeatureCollection {
-
-    /// Writes the FeatureCollection to a GeoPackage (.gpkg) file.
-    ///
-    /// - Parameters:
-    ///   - url: The file URL to write to.
-    ///   - table: The name of the feature table to create (default `"features"`).
-    ///   - createSpatialIndex: If `true`, creates a `gpkg_rtree_index` spatial
-    ///     index for faster bounding-box queries (default `false`).
-    /// - Throws: A ``GeoPackageError`` if the file cannot be written.
-    public func writeGeopackage(
-        to url: URL,
-        table: String = "features",
-        createSpatialIndex: Bool = false
-    ) async throws {
-        let conn = try GeoPackageConnection(url: url, skipValidation: true)
-        try await writeGeopackage(into: conn, table: table, createSpatialIndex: createSpatialIndex)
-        await conn.close()
-    }
-
-    /// Writes the FeatureCollection into an existing GeoPackage
-    /// connection so the same connection can be reused for reads.
-    ///
-    /// ```swift
-    /// let gpkg = try await GeoPackageConnection(url: url, skipValidation: true)
-    /// try await fc.writeGeopackage(into: gpkg)
-    /// let features = try await gpkg.readFeatures(table: "features")
-    /// ```
-    ///
-    /// - Parameters:
-    ///   - conn: An open GeoPackage connection.
-    ///   - table: The name of the feature table to create (default `"features"`).
-    ///   - createSpatialIndex: If `true`, creates a `gpkg_rtree_index` spatial
-    ///     index for faster bounding-box queries (default `false`).
-    /// - Throws: A ``GeoPackageError`` if the file cannot be written.
-    public func writeGeopackage(
-        into conn: GeoPackageConnection,
-        table: String = "features",
-        createSpatialIndex: Bool = false
-    ) async throws {
-        try await conn.createMetadata()
-        try await conn.write(features: self, to: table, createSpatialIndex: createSpatialIndex)
-    }
-
-}
-
 // MARK: - Writer
 
 enum GeoPackageWriter {
@@ -113,18 +67,15 @@ enum GeoPackageWriter {
         for feature in features {
             let geometry = feature.geometry
 
-            // Encode geometry to WKB and prepend GeoPackage header
             guard let wkb = WKBCoder.encode(
                 geometry: geometry,
                 byteOrder: .littleEndian,
                 targetProjection: nil)
             else { continue }
 
-            // Calculate envelope from geometry
             let envelope = geometry.boundingBox ?? geometry.calculateBoundingBox()
             let headerWkb = WKBHeader.prependHeader(to: wkb, srid: srsId, envelope: envelope)
 
-            // Update bounding box
             if let envelope {
                 minX = min(minX, envelope.southWest.longitude)
                 minY = min(minY, envelope.southWest.latitude)
@@ -132,13 +83,11 @@ enum GeoPackageWriter {
                 maxY = max(maxY, envelope.northEast.latitude)
             }
 
-            // Build values array (skip geom at index 0)
             var values: [Any] = [headerWkb]
             for (name, _) in columnDefs.dropFirst() {
                 values.append(feature.properties[name] as Any)
             }
 
-            // Insert via prepared statement
             try insertRow(db: db, sql: insertSQL, values: values)
         }
 
@@ -172,7 +121,6 @@ enum GeoPackageWriter {
 
     // MARK: - Spatial index
 
-    /// Creates a `gpkg_rtree_index` spatial index on the feature table.
     private static func createSpatialIndexOnTable(
         table: String,
         geomColumnName: String,
@@ -182,13 +130,11 @@ enum GeoPackageWriter {
     ) throws {
         let rtreeName = GeoPackage.rTreeTableName(for: table, column: geomColumnName)
 
-        // Create rtree virtual table
         try db.execute("""
             CREATE VIRTUAL TABLE \(rtreeName)
             USING rtree("id", "minx", "maxx", "miny", "maxy");
             """)
 
-        // Insert bounding boxes for each feature
         var rowId: Int64 = 1
         for feature in features {
             if let envelope = feature.boundingBox ?? feature.calculateBoundingBox() {
@@ -205,7 +151,6 @@ enum GeoPackageWriter {
             rowId += 1
         }
 
-        // Register in gpkg_extensions
         let escapedTable = GeoPackage.sanitizeStringLiteral(table)
         let escapedCol = GeoPackage.sanitizeStringLiteral(geomColumnName)
         try db.execute("""
@@ -250,7 +195,6 @@ enum GeoPackageWriter {
 
     // MARK: - Schema inference
 
-    /// Infer column types from feature properties.
     private static func inferPropertySchema(from features: [Feature]) -> [(String, String)] {
         var allKeys = Set<String>()
         for f in features {
@@ -294,7 +238,7 @@ enum GeoPackageWriter {
         }
 
         let stepRC = sqlite3_step(stmt)
-        guard stepRC == 101 else {  // SQLITE_DONE
+        guard stepRC == 101 else {
             throw GeoPackageError.sqliteError(detail: "Failed to insert row: \(db.lastErrorMessage())")
         }
     }
