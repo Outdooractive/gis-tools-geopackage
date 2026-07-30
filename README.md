@@ -130,6 +130,38 @@ let related = try await feature.relatedAttributes(in: gpkg)
 let media = try await feature.relatedMedia(in: gpkg)
 ```
 
+### Feature identifiers
+
+GeoPackage feature tables distinguish between two kinds of identifier. This library handles both:
+
+#### 1. The GeoJSON `Feature.id` (the `id` column)
+
+The OGC GeoPackage spec requires every feature table to have an `INTEGER PRIMARY KEY` column that acts as a `rowid` alias. GeoJSON `Feature.id` values, however, can be strings, integers, or doubles — not necessarily numeric. This library therefore writes **two** columns:
+
+- **`fid`** — `INTEGER PRIMARY KEY AUTOINCREMENT`. This is the spec-mandated primary key; it is auto-assigned by SQLite and never derived from `Feature.id`.
+- **`id`** — stores the GeoJSON `Feature.id`. Its SQLite type is **inferred** from the identifiers in the collection so that uniform collections round-trip with type fidelity:
+
+  | `Feature.id` values in the collection | `id` column type | Read-back `Feature.id` |
+  |---|---|---|
+  | all `.int` / `.uint` | `INTEGER` | `.int` |
+  | all `.double` | `REAL` | `.double` |
+  | all `.string` | `TEXT` | `.string` |
+  | mixed types (or none) | `TEXT` | `.string` (fallback) |
+
+  Mixed-type collections fall back to `TEXT` because no single SQLite type can hold every value; integer ids in such a collection come back as `.string` (e.g. `.int(42)` → `.string("42")`).
+
+#### 2. The GeoPackage row id (`gpkgRowId`)
+
+`feature.gpkgRowId` reflects the `fid` INTEGER primary key (the SQLite `rowid`), not the GeoJSON `Feature.id`. It is stored in `foreignMembers` (key `_gpkg_rowid`) and is set automatically by the reader. It is the value used to resolve related attribute/media rows:
+
+```swift
+let feature = fc.features[0]
+feature.id            // Feature.Identifier?   — the GeoJSON id (from the `id` column)
+feature.gpkgRowId     // Int?                  — the SQLite rowid (from the `fid` PK)
+```
+
+On **read-back**, the `id`/`fid` column value is promoted to `Feature.id` based on the runtime SQLite cell type (`Int` → `.int`, `Double` → `.double`, `String` → `.string`, `NULL` → `nil`), so typed columns round-trip with type fidelity. The `fid`/`id` columns are never leaked into `feature.properties`.
+
 ### Schema inspection
 
 ```swift
@@ -139,6 +171,8 @@ let tileTables = try await gpkg.tileTables()
 ```
 
 ## Property type mapping
+
+Feature `properties` (attribute columns other than `fid`, `id`, and the geometry column) are mapped as follows:
 
 | GeoPackage type | Swift type |
 |---|---|
