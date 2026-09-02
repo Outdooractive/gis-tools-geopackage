@@ -1,5 +1,5 @@
 import Foundation
-import CSQLite
+import OACSQLite
 
 /// A thread-safe SQLite wrapper for GeoPackage operations.
 ///

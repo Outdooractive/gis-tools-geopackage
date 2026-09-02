@@ -1,5 +1,5 @@
 import Foundation
-import CSQLite
+import OACSQLite
 import GISTools
 
 // MARK: - Reader
