@@ -20,7 +20,7 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(
-            name: "CSQLite",
+            name: "OACSQLite",
             pkgConfig: "sqlite3",
             providers: [
                 .apt(["libsqlite3-dev"]),
@@ -30,7 +30,7 @@ let package = Package(
             name: "GISToolsGeoPackage",
             dependencies: [
                 .product(name: "GISTools", package: "gis-tools"),
-                "CSQLite",
+                "OACSQLite",
             ]),
         .testTarget(
             name: "GISToolsGeoPackageTests",

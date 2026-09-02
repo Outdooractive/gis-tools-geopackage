@@ -1,5 +1,5 @@
 import Foundation
-import CSQLite
+import OACSQLite
 import GISTools
 
 /// An `AsyncSequence` that yields features from a GeoPackage feature

@@ -1,5 +1,5 @@
 import Foundation
-import CSQLite
+import OACSQLite
 import GISTools
 
 /// Writes tile (raster) data to a GeoPackage database.
