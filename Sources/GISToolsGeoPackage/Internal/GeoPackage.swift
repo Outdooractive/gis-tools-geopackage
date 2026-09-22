@@ -277,13 +277,33 @@ enum GeoPackage {
     // MARK: - SRS lookup
 
     /// Map a Projection to the corresponding GeoPackage SRS ID.
+    ///
+    /// GeoPackage SRS IDs are EPSG codes for EPSG-registered projections;
+    /// coordinates without an SRID fall back to EPSG:4326.
     static func srsId(for projection: Projection) -> Int {
-        switch projection {
-        case .epsg4326: return 4326
-        case .epsg3857: return 3857
-        case .epsg4978: return 4978
-        case .noSRID: return 4326  // default
+        projection.hasSRID ? projection.srid : 4326
+    }
+
+    /// Ensure a `gpkg_spatial_ref_sys` row exists for the given SRS ID.
+    ///
+    /// The default SRS rows (4326/3857/4978) are pre-inserted by
+    /// ``createMetadata(in:)``. Any other EPSG-registered projection gets a
+    /// row with an `undefined` definition, as allowed by the GeoPackage spec
+    /// (see requirement 8 / appendix E.1).
+    ///
+    /// - Parameter srsId: The SRS ID to ensure, e.g. from ``srsId(for:)``.
+    static func ensureSrsRow(_ srsId: Int, in db: SQLiteDB) throws {
+        guard srsId != 4326, srsId != 3857, srsId != 4978 else { return }
+
+        let existing = try db.query(
+            "SELECT count(*) as cnt FROM gpkg_spatial_ref_sys WHERE srs_id = \(srsId);")
+        if let first = existing.first, (first["cnt"] as? Int ?? 0) > 0 {
+            return
         }
+
+        let escapedName = "EPSG:\(srsId)".replacingOccurrences(of: "'", with: "''")
+        try db.execute(
+            "INSERT INTO gpkg_spatial_ref_sys (srs_id, srs_name, srs_type, organization, organization_coordsys_id, definition, description) VALUES (\(srsId), '\(escapedName)', 'undefined', 'EPSG', \(srsId), 'undefined', NULL);")
     }
 
     /// Map a GeoPackage SRS ID to the library's Projection.

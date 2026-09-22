@@ -30,6 +30,7 @@ enum GeoPackageWriter {
 
         let projection = features[0].projection
         let srsId = GeoPackage.srsId(for: projection)
+        try GeoPackage.ensureSrsRow(srsId, in: db)
 
         // Collect all property keys with their inferred types
         let propertySchema = inferPropertySchema(from: features)
