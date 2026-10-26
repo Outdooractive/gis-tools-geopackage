@@ -14,64 +14,50 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS
-            os: macos-latest
-          - name: Linux
-            os: ubuntu-latest
-    runs-on: ${{ matrix.os }}
+  macos:
+    name: test (macOS)
+    runs-on: macos-latest
     timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install SQLite (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev pkg-config
-
-      - uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: "6.1"
-
       - name: Build
         run: swift build --build-tests
-
       - name: Test with coverage
         run: swift test --enable-code-coverage
-
       - name: Coverage summary and gate
         run: python3 scripts/coverage_summary.py --minimum 85
 
-      - name: Upload coverage
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-${{ matrix.name }}
-          path: .build/**/codecov/*.json
-          if-no-files-found: warn
+  linux:
+    name: test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: swift:latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SQLite and Python
+        run: |
+          apt-get update
+          apt-get install -y libsqlite3-dev pkg-config python3
+      - name: Build
+        run: swift build --build-tests
+      - name: Test with coverage
+        run: swift test --enable-code-coverage
+      - name: Coverage summary and gate
+        run: python3 scripts/coverage_summary.py --minimum 85
 
   documentation:
     name: documentation
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    container: swift:latest
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install SQLite
+      - name: Install SQLite and Python
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev pkg-config
-
-      - uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: "6.1"
-
+          apt-get update
+          apt-get install -y libsqlite3-dev pkg-config python3
       - name: Build DocC catalog
         run: python3 scripts/check_documentation.py
