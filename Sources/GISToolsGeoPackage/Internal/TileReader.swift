@@ -17,13 +17,15 @@ enum TileReader {
         in db: SQLiteDB
     ) throws -> Data? {
         let sanitized = GeoPackage.sanitizeIdentifier(tableName)
-        let blobs = try db.queryRawBlob("""
+        let blobs = try db.queryRawBlob(
+            """
             SELECT tile_data FROM \(sanitized)
-            WHERE zoom_level = \(key.zoom)
-              AND tile_column = \(key.column)
-              AND tile_row = \(key.row)
+            WHERE zoom_level = ?
+              AND tile_column = ?
+              AND tile_row = ?
             LIMIT 1;
-            """)
+            """,
+            values: [key.zoom, key.column, key.row])
         return blobs.first ?? nil
     }
 
@@ -68,7 +70,13 @@ enum TileReader {
                   let column = row["tile_column"] as? Int,
                   let rowIndex = row["tile_row"] as? Int,
                   let data = row["tile_data"] as? Data
-            else { continue }
+            else {
+                throw GeoPackageError.invalidGeoPackage(
+                    detail: """
+                        Tile table '\(tableName)' contains a row with missing \
+                        zoom, column, row or tile data
+                        """)
+            }
 
             let key = TileKey(
                 zoom: zoom,
@@ -89,12 +97,13 @@ enum TileReader {
         for tableName: String,
         in db: SQLiteDB
     ) throws -> TileMatrixSet? {
-        let escaped = GeoPackage.sanitizeStringLiteral(tableName)
-        let rows: [[String: Sendable]] = try db.query("""
+        let rows: [[String: Sendable]] = try db.query(
+            """
             SELECT table_name, srs_id, min_x, min_y, max_x, max_y
             FROM gpkg_tile_matrix_set
-            WHERE table_name = \(escaped);
-            """)
+            WHERE table_name = ?;
+            """,
+            values: [tableName])
 
         guard let row = rows.first,
               let name = row["table_name"] as? String,
@@ -108,13 +117,12 @@ enum TileReader {
         return TileMatrixSet(
             tableName: name,
             srsId: rawSrsId,
-            bounds: BoundingBox(
-                southWest: Coordinate3D(
-                    latitude: minY,
-                    longitude: minX),
-                northEast: Coordinate3D(
-                    latitude: maxY,
-                    longitude: maxX)))
+            bounds: GeoPackage.boundingBox(
+                minX: minX,
+                minY: minY,
+                maxX: maxX,
+                maxY: maxY,
+                srsId: rawSrsId))
     }
 
     /// Reads tile matrix metadata for all zoom levels of a tile table.
@@ -127,16 +135,17 @@ enum TileReader {
         for tableName: String,
         in db: SQLiteDB
     ) throws -> [TileMatrix] {
-        let escaped = GeoPackage.sanitizeStringLiteral(tableName)
-        let rows: [[String: Sendable]] = try db.query("""
+        let rows: [[String: Sendable]] = try db.query(
+            """
             SELECT table_name, zoom_level, matrix_width, matrix_height,
                    tile_width, tile_height, pixel_x_size, pixel_y_size
             FROM gpkg_tile_matrix
-            WHERE table_name = \(escaped)
+            WHERE table_name = ?
             ORDER BY zoom_level;
-            """)
+            """,
+            values: [tableName])
 
-        return rows.compactMap { row in
+        return try rows.map { row in
             guard let name = row["table_name"] as? String,
                   let zoom = row["zoom_level"] as? Int,
                   let mw = row["matrix_width"] as? Int,
@@ -145,7 +154,13 @@ enum TileReader {
                   let th = row["tile_height"] as? Int,
                   let px = row["pixel_x_size"] as? Double,
                   let py = row["pixel_y_size"] as? Double
-            else { return nil }
+            else {
+                throw GeoPackageError.invalidGeoPackage(
+                    detail: """
+                        gpkg_tile_matrix contains an incomplete row for \
+                        '\(tableName)'
+                        """)
+            }
 
             return TileMatrix(
                 tableName: name,

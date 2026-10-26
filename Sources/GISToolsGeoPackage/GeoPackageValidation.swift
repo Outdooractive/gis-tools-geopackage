@@ -31,9 +31,9 @@ public struct GeoPackageValidation: Sendable {
 
 /// A GeoPackage spec violation.  Each case carries the relevant context
 /// and can produce a human-readable ``message``.
-public enum GeoPackageValidationIssue: Sendable {
+public enum GeoPackageValidationIssue: Sendable, Equatable {
 
-    /// The `application_id` PRAGMA is not `GP10` or `GPKG`.
+    /// The `application_id` PRAGMA is not `GPKG` (or legacy `GP10`).
     case invalidApplicationId
 
     /// The `user_version` PRAGMA is below 10200 (1.2.0).
@@ -50,6 +50,12 @@ public enum GeoPackageValidationIssue: Sendable {
 
     /// `gpkg_spatial_ref_sys` exists but contains no entries.
     case emptySrsTable
+
+    /// `gpkg_contents` exists but contains no rows.
+    case emptyContentsTable
+
+    /// A mandatory Spatial Reference System row is missing.
+    case missingSrsEntry(_ srsId: Int)
 
     /// A `gpkg_contents` entry has a `data_type` value that is not one
     /// of the recognised types: `"features"`, `"tiles"`,
@@ -100,7 +106,7 @@ public enum GeoPackageValidationIssue: Sendable {
     public var message: String {
         switch self {
         case .invalidApplicationId:
-            "Invalid application_id — expected GP10 or GPKG"
+            "Invalid application_id — expected GPKG (or legacy GP10)"
         case .invalidUserVersion:
             "Invalid or missing user_version — expected >= 10200 (1.2.0)"
         case .missingMandatoryTable(let name):
@@ -111,6 +117,10 @@ public enum GeoPackageValidationIssue: Sendable {
             "\(table) missing required column: \(column)"
         case .emptySrsTable:
             "gpkg_spatial_ref_sys is empty — no SRS entries"
+        case .emptyContentsTable:
+            "gpkg_contents is empty — no registered tables"
+        case .missingSrsEntry(let srsId):
+            "gpkg_spatial_ref_sys is missing mandatory SRS \(srsId)"
         case .unknownDataType(let table, let type):
             "gpkg_contents: '\(table)' has unknown data_type '\(type)'"
         case .missingReferencedTable(let table):

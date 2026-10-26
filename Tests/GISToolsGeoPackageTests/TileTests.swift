@@ -107,9 +107,7 @@ struct GeoPackageTileTests {
             TileKey(zoom: 0, column: 0, row: 0): tileData,
         ]
 
-        let bounds = BoundingBox(
-            southWest: Coordinate3D(latitude: -85.0, longitude: -180.0),
-            northEast: Coordinate3D(latitude: 85.0, longitude: 180.0))
+        let bounds = TestSupport.webMercatorWorld
 
         let matrices = [
             TileMatrix(tableName: "pyramid",
@@ -166,9 +164,7 @@ struct GeoPackageTileTests {
             TileKey(zoom: 1, column: 1, row: 1): t1,
         ]
 
-        let bounds = BoundingBox(
-            southWest: Coordinate3D(latitude: -85.0, longitude: -180.0),
-            northEast: Coordinate3D(latitude: 85.0, longitude: 180.0))
+        let bounds = TestSupport.webMercatorWorld
 
         let matrices = [
             TileMatrix(tableName: "tt",

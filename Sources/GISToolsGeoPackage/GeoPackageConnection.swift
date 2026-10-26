@@ -16,21 +16,28 @@ import GISTools
 /// let attrs = try await gpkg.readAttributeTable(table: "info", rowId: 42)
 /// ```
 ///
-/// The existing convenience APIs (`FeatureCollection(geopackage:)`,
-/// `GeoPackage.readAttributeTable(from:)`, etc.) are implemented on
-/// top of this actor and remain fully backward compatible.
+/// For one-shot operations use ``GeoPackageCoder`` or the static
+/// ``GeoPackage`` helpers; they open and close their own connection.
 public actor GeoPackageConnection {
 
     private let db: SQLiteDB
 
     /// Opens a connection to a GeoPackage file.
     ///
-    /// - Parameter url: The file URL of a `.gpkg` database.
-    /// - Parameter skipValidation: If `true`, skips the initial metadata
-    ///   validation (useful when creating a new GeoPackage).
-    /// - Throws: A ``GeoPackageError`` if validation fails.
-    public init(url: URL, skipValidation: Bool = false) throws {
-        db = try SQLiteDB(path: url.path)
+    /// - Parameters:
+    ///   - url: The file URL of a `.gpkg` database.
+    ///   - skipValidation: If `true`, skips the initial metadata validation
+    ///     (useful when creating a new GeoPackage).
+    ///   - readOnly: If `true`, opens the file with `SQLITE_OPEN_READONLY`.
+    ///     Missing files then fail instead of being created.
+    /// - Throws: A ``GeoPackageError`` if the file cannot be opened or
+    ///   validation fails.
+    public init(
+        url: URL,
+        skipValidation: Bool = false,
+        readOnly: Bool = false
+    ) throws {
+        db = try SQLiteDB(path: url.path, readOnly: readOnly)
         if !skipValidation {
             try GeoPackage.validateMetadata(in: db)
         }
@@ -38,26 +45,30 @@ public actor GeoPackageConnection {
 
     /// Opens a connection to a GeoPackage file.
     ///
-    /// - Parameter path: The file system path of a `.gpkg` database.
-    /// - Parameter skipValidation: If `true`, skips the initial metadata
-    ///   validation (useful when creating a new GeoPackage).
-    /// - Throws: A ``GeoPackageError`` if validation fails.
-    public init(path: String, skipValidation: Bool = false) throws {
-        db = try SQLiteDB(path: path)
+    /// - Parameters:
+    ///   - path: The file system path of a `.gpkg` database.
+    ///   - skipValidation: If `true`, skips the initial metadata validation
+    ///     (useful when creating a new GeoPackage).
+    ///   - readOnly: If `true`, opens the file with `SQLITE_OPEN_READONLY`.
+    ///     Missing files then fail instead of being created.
+    /// - Throws: A ``GeoPackageError`` if the file cannot be opened or
+    ///   validation fails.
+    public init(
+        path: String,
+        skipValidation: Bool = false,
+        readOnly: Bool = false
+    ) throws {
+        db = try SQLiteDB(path: path, readOnly: readOnly)
         if !skipValidation {
             try GeoPackage.validateMetadata(in: db)
         }
     }
 
-    /// Closes the connection.  The instance should not be used after
-    /// calling this method.
+    /// Closes the connection. Calling this method more than once is safe.
+    /// The instance must not be used for further operations after closing.
     public func close() {
         db.close()
     }
-
-    /// The underlying SQLite database handle, exposed for `FeatureStream`.
-    /// Use only from a single task at a time.
-    nonisolated var _db: SQLiteDB { db }
 
 }
 
@@ -84,6 +95,18 @@ extension GeoPackageConnection {
         try GeoPackage.readContents(from: db)
     }
 
+    /// Returns the feature tables registered in `gpkg_contents`.
+    public func featureTables() throws -> [GeoPackageTable] {
+        try GeoPackage.readContents(from: db)
+            .filter { $0.dataType == "features" }
+    }
+
+    /// Returns the tile tables registered in `gpkg_contents`.
+    public func tileTables() throws -> [GeoPackageTable] {
+        try GeoPackage.readContents(from: db)
+            .filter { $0.dataType == "tiles" }
+    }
+
     /// Checks whether a spatial (rtree) index exists for the given
     /// feature table and geometry column.
     /// - Parameters:
@@ -108,24 +131,49 @@ extension GeoPackageConnection {
     }
 
     /// Reads a page of features from a feature table.
+    ///
+    /// Rows are returned in ascending `rowid` order, so pages are stable as
+    /// long as the table is not modified between calls.
     public func readFeatures(
         table: String,
         limit: Int,
-        offset: Int,
+        offset: Int = 0,
         boundingBox: BoundingBox? = nil
     ) throws -> [Feature] {
-        try GeoPackageReader.readFeatures(from: db, table: table, boundingBox: boundingBox, limit: limit, offset: offset)
+        try GeoPackageReader.readFeatures(
+            from: db,
+            table: table,
+            boundingBox: boundingBox,
+            limit: limit,
+            offset: offset)
     }
 
     /// Returns an async sequence of features from a feature table.
-    public func features(
+    ///
+    /// - Parameters:
+    ///   - table: The feature table name.
+    ///   - boundingBox: An optional bounding box in any projection.
+    ///   - limit: An optional maximum number of features.
+    ///   - offset: The number of matching features to skip.
+    nonisolated public func features(
         table: String,
-        boundingBox: BoundingBox? = nil
+        boundingBox: BoundingBox? = nil,
+        limit: Int? = nil,
+        offset: Int = 0
     ) -> FeatureStream {
-        FeatureStream(db: db, table: table, boundingBox: boundingBox)
+        FeatureStream(
+            db: db,
+            table: table,
+            boundingBox: boundingBox,
+            limit: limit,
+            offset: offset)
     }
 
     /// Writes features to a feature table.
+    ///
+    /// The table is created when it does not exist and appended to otherwise.
+    /// Missing property columns are added automatically, metadata bounds are
+    /// extended, and an existing R-tree index is kept in sync.
     public func write(
         features fc: FeatureCollection,
         to table: String,
@@ -155,10 +203,12 @@ extension GeoPackageConnection {
     ///   - table: The attribute table to write.
     ///   - relationship: Optional relationship to link to a feature table.
     public func write(attributeTable table: AttributeTable, relationship: RelationRow? = nil) throws {
-        try GeoPackage.writeAttributeTable(table, in: db)
-        if let rel = relationship {
-            try registerRelatedTablesExtension()
-            try write(relation: rel)
+        try db.withTransaction {
+            try GeoPackage.writeAttributeTable(table, in: db)
+            if let rel = relationship {
+                try GeoPackage.registerRelatedTablesExtension(in: db)
+                try GeoPackage.writeRelation(rel, in: db)
+            }
         }
     }
 
@@ -187,10 +237,12 @@ extension GeoPackageConnection {
     ///   - table: The media table to write.
     ///   - relationship: Optional relationship to link to a feature table.
     public func write(mediaTable table: MediaTable, relationship: RelationRow? = nil) throws {
-        try GeoPackage.writeMediaTable(table, in: db)
-        if let rel = relationship {
-            try registerRelatedTablesExtension()
-            try write(relation: rel)
+        try db.withTransaction {
+            try GeoPackage.writeMediaTable(table, in: db)
+            if let rel = relationship {
+                try GeoPackage.registerRelatedTablesExtension(in: db)
+                try GeoPackage.writeRelation(rel, in: db)
+            }
         }
     }
 
@@ -207,6 +259,24 @@ extension GeoPackageConnection {
     /// - Returns: The tile data, or `nil` if not found.
     public func readTile(for key: TileKey, from table: String) throws -> Data? {
         try TileReader.readTile(for: key, from: table, in: db)
+    }
+
+    /// Reads a single tile blob using an XYZ `MapTile`.
+    /// - Parameters:
+    ///   - mapTile: The tile in XYZ convention.
+    ///   - matrixHeight: The number of tile rows at the tile's zoom level.
+    ///   - table: The tile table name.
+    /// - Returns: The tile data, or `nil` if not found.
+    public func readTile(
+        for mapTile: MapTile,
+        matrixHeight: Int,
+        from table: String
+    ) throws -> Data? {
+        try TileReader.readTile(
+            for: mapTile,
+            matrixHeight: matrixHeight,
+            from: table,
+            in: db)
     }
 
     /// Reads all tiles from a tile table.
@@ -248,6 +318,26 @@ extension GeoPackageConnection {
         try TileWriter.write(tileData: tileData, for: key, to: table, in: db)
     }
 
+    /// Writes a single tile blob using an XYZ `MapTile`.
+    /// - Parameters:
+    ///   - tileData: The raw tile image data.
+    ///   - mapTile: The tile in XYZ convention.
+    ///   - matrixHeight: The number of tile rows at the tile's zoom level.
+    ///   - table: The tile table name.
+    public func write(
+        tileData: Data,
+        for mapTile: MapTile,
+        matrixHeight: Int,
+        to table: String
+    ) throws {
+        try TileWriter.write(
+            tileData: tileData,
+            for: mapTile,
+            matrixHeight: matrixHeight,
+            to: table,
+            in: db)
+    }
+
     /// Writes a complete tile pyramid including metadata tables.
     public func writeTilePyramid(
         tiles: [TileKey: Data],
@@ -277,10 +367,14 @@ extension GeoPackageConnection {
         try GeoPackage.readRelations(in: db)
     }
 
-    /// Inserts a relationship row into `gpkgext_relations`.
+    /// Inserts a relationship row into `gpkgext_relations` and registers the
+    /// Related Tables Extension if necessary.
     /// - Parameter relation: The relationship descriptor.
     public func write(relation: RelationRow) throws {
-        try GeoPackage.writeRelation(relation, in: db)
+        try db.withTransaction {
+            try GeoPackage.registerRelatedTablesExtension(in: db)
+            try GeoPackage.writeRelation(relation, in: db)
+        }
     }
 
     /// Registers the Related Tables Extension in `gpkg_extensions`.

@@ -1,235 +1,258 @@
 import Foundation
-import OACSQLite
 import GISTools
 
-/// An `AsyncSequence` that yields features from a GeoPackage feature
-/// table one at a time without loading the entire result set into memory.
-public struct FeatureStream: AsyncSequence {
+/// An `AsyncSequence` that yields features from a GeoPackage feature table.
+///
+/// Features are fetched in bounded chunks, so the whole result set is never
+/// loaded into memory. Row decoding is shared with
+/// ``GeoPackageConnection/readFeatures(table:boundingBox:)``, which keeps
+/// identifiers, properties and projection handling consistent between the
+/// synchronous and streaming APIs.
+///
+/// ```swift
+/// let gpkg = try await GeoPackageConnection(url: url)
+/// for try await feature in gpkg.features(table: "countries") {
+///     print(feature.id as Any)
+/// }
+/// ```
+public struct FeatureStream: AsyncSequence, Sendable {
 
     public typealias Element = Feature
-    private let db: SQLiteDB
+
+    /// Number of raw rows fetched per database round trip.
+    private static let chunkSize = 500
+
+    private let database: Database
     private let table: String
     private let boundingBox: BoundingBox?
+    private let limit: Int?
+    private let offset: Int
 
-    init(db: SQLiteDB,
-         table: String,
-         boundingBox: BoundingBox? = nil
+    /// Creates a stream backed by an existing database handle.
+    ///
+    /// Internal because ``GeoPackageConnection`` owns the connection.
+    init(
+        db: SQLiteDB,
+        table: String,
+        boundingBox: BoundingBox? = nil,
+        limit: Int? = nil,
+        offset: Int = 0
     ) {
-        self.db = db
+        self.database = Database(db: db)
         self.table = table
         self.boundingBox = boundingBox
+        self.limit = limit
+        self.offset = offset
+    }
+
+    /// Creates a stream that opens its own read-only connection.
+    ///
+    /// The connection is closed when the stream (and all of its copies) are
+    /// deallocated. Prefer
+    /// ``GeoPackageConnection/features(table:boundingBox:limit:offset:)``
+    /// when an existing connection should be reused.
+    ///
+    /// - Parameters:
+    ///   - url: The GeoPackage file URL.
+    ///   - table: The feature table name.
+    ///   - boundingBox: An optional bounding box in any projection.
+    ///   - limit: An optional maximum number of features.
+    ///   - offset: The number of matching features to skip.
+    /// - Throws: ``GeoPackageError`` if the file cannot be opened.
+    public init(
+        url: URL,
+        table: String,
+        boundingBox: BoundingBox? = nil,
+        limit: Int? = nil,
+        offset: Int = 0
+    ) throws {
+        self.database = try Database(url: url)
+        self.table = table
+        self.boundingBox = boundingBox
+        self.limit = limit
+        self.offset = offset
     }
 
     /// Creates the async iterator for the feature stream.
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(db: db, table: table, boundingBox: boundingBox)
+        AsyncIterator(
+            database: database,
+            table: table,
+            boundingBox: boundingBox,
+            limit: limit,
+            offset: offset)
     }
 
+    // MARK: - Connection owner
+
+    /// Keeps an optionally owned connection alive for the lifetime of the
+    /// stream. A struct cannot have a `deinit`, so the owner is a class.
+    fileprivate final class Database: @unchecked Sendable {
+
+        let db: SQLiteDB
+        private let ownsConnection: Bool
+
+        init(db: SQLiteDB) {
+            self.db = db
+            self.ownsConnection = false
+        }
+
+        init(url: URL) throws {
+            self.db = try SQLiteDB(path: url.path, readOnly: true)
+            self.ownsConnection = true
+        }
+
+        deinit {
+            if ownsConnection {
+                db.close()
+            }
+        }
+
+    }
+
+    // MARK: - Iterator
+
     /// An async iterator that yields features one at a time.
-    /// Created by ``FeatureStream.makeAsyncIterator()``.
+    /// Created by ``FeatureStream/makeAsyncIterator()``.
     public struct AsyncIterator: AsyncIteratorProtocol {
 
-        private let db: SQLiteDB
+        private let database: Database
         private let table: String
         private let boundingBox: BoundingBox?
-        private var stmt: OpaquePointer?
-        private var geomColumnName: String = "geom"
-        private var srsId: Int = 4326
-        private var columnNames: [String] = []
-        private var idColumnName: String? = nil
-        private var pkColumnName: String? = nil
+        private let limit: Int?
+        private var skipRemaining: Int
+
+        private var metadata: FeatureTableMetadata?
+        private var useRTree = false
+        private var fetchOffset = 0
+        private var emitRemaining: Int?
+        private var buffered: [Feature] = []
+        private var bufferIndex = 0
+        private var endReached = false
         private var started = false
         private var finished = false
 
-        init(db: SQLiteDB,
-             table: String,
-             boundingBox: BoundingBox?
+        fileprivate init(
+            database: Database,
+            table: String,
+            boundingBox: BoundingBox?,
+            limit: Int?,
+            offset: Int
         ) {
-            self.db = db
+            self.database = database
             self.table = table
             self.boundingBox = boundingBox
+            self.limit = limit
+            self.skipRemaining = offset
         }
 
         public mutating func next() async throws -> Feature? {
             if finished { return nil }
-            if !started {
-                try start()
-                started = true
+
+            do {
+                if !started {
+                    try start()
+                    started = true
+                }
+                if finished { return nil }
+                return try nextFeature()
             }
-            return fetchNext()
+            catch {
+                finished = true
+                throw error
+            }
         }
 
         private mutating func start() throws {
-            let escapedTable = GeoPackage.sanitizeStringLiteral(table)
-            let quotedTable = GeoPackage.sanitizeIdentifier(table)
-
-            let geomCols = try db.query(
-                "SELECT column_name, geometry_type_name, srs_id, z, m FROM gpkg_geometry_columns WHERE table_name = \(escapedTable);")
-
-            guard let geomMeta = geomCols.first else {
-                throw GeoPackageError.invalidGeoPackage(detail: "Table '\(table)' not found in gpkg_geometry_columns")
+            if let limit, limit < 0 {
+                throw GeoPackageError.invalidArgument(
+                    detail: "limit must not be negative")
             }
-            guard geomCols.count == 1 else {
-                throw GeoPackageError.mixedGeometryTypes(detail: "Table '\(table)' has multiple geometry columns")
+            guard skipRemaining >= 0 else {
+                throw GeoPackageError.invalidArgument(
+                    detail: "offset must not be negative")
             }
 
-            geomColumnName = geomMeta["column_name"] as? String ?? "geom"
-            srsId = geomMeta["srs_id"] as? Int ?? 4326
-
-            let tableInfo = try db.query("PRAGMA table_info(\(quotedTable));")
-            columnNames = tableInfo.compactMap { $0["name"] as? String }
-            guard !columnNames.isEmpty else {
-                throw GeoPackageError.invalidGeoPackage(detail: "Table '\(table)' has no columns")
-            }
-
-            // Detect the GeoJSON id column: prefer an explicit `id` column,
-            // then the common GeoPackage `fid` PK column. Values from this
-            // column are promoted to `Feature.id` on read-back regardless of
-            // storage type.
-            idColumnName = {
-                if columnNames.contains("id") { return "id" }
-                if columnNames.contains("fid") { return "fid" }
-                return nil
-            }()
-            // The INTEGER PRIMARY KEY column acts as the rowid alias. When
-            // present it is excluded from `properties` and its value populates
-            // `gpkgRowId`.
-            pkColumnName = {
-                for col in tableInfo {
-                    if (col["pk"] as? Int ?? 0) > 0,
-                       (col["type"] as? String ?? "").lowercased().contains("integer")
-                    {
-                        return col["name"] as? String
-                    }
-                }
-                return nil
-            }()
-
-            let rtreeAvailable = try GeoPackage.hasRTreeIndex(for: table, column: geomColumnName, in: db)
-
-            let selectSQL = "SELECT rowid, *"
-            let rtreeJoinSQL: String
-            if let bbox = boundingBox, rtreeAvailable {
-                let rtreeName = GeoPackage.rTreeTableName(for: table, column: geomColumnName)
-                let minX = bbox.southWest.longitude
-                let minY = bbox.southWest.latitude
-                let maxX = bbox.northEast.longitude
-                let maxY = bbox.northEast.latitude
-                rtreeJoinSQL = " INNER JOIN \(rtreeName) ON rowid = \(rtreeName).id WHERE \(rtreeName).minx <= \(maxX) AND \(rtreeName).maxx >= \(minX) AND \(rtreeName).miny <= \(maxY) AND \(rtreeName).maxy >= \(minY)"
+            let metadata = try FeatureTableMetadata.load(
+                table: table, in: database.db)
+            self.metadata = metadata
+            if let boundingBox,
+               !GeoPackage.crossesAntimeridian(boundingBox)
+            {
+                self.useRTree = try GeoPackage.hasRTreeIndex(
+                    for: table,
+                    column: metadata.geomColumnName,
+                    in: database.db)
             }
             else {
-                rtreeJoinSQL = ""
+                self.useRTree = false
             }
-
-            let sql = "\(selectSQL) FROM \(quotedTable)\(rtreeJoinSQL);"
-            stmt = try db.prepare(sql)
+            self.emitRemaining = limit
+            if limit == 0 {
+                finished = true
+            }
         }
 
-        private mutating func fetchNext() -> Feature? {
-            guard let stmt else { return nil }
+        private mutating func nextFeature() throws -> Feature? {
+            guard let metadata else { return nil }
 
             while true {
-                let rc = sqlite3_step(stmt)
-                guard rc == SQLITE_ROW else {
-                    sqlite3_finalize(stmt)
-                    self.stmt = nil
+                if bufferIndex < buffered.count {
+                    let feature = buffered[bufferIndex]
+                    bufferIndex += 1
+
+                    if self.boundingBox != nil, feature.geometry == nil {
+                        continue
+                    }
+                    if let boundingBox, !feature.intersects(boundingBox) {
+                        continue
+                    }
+                    if skipRemaining > 0 {
+                        skipRemaining -= 1
+                        continue
+                    }
+                    if let remaining = emitRemaining {
+                        guard remaining > 0 else {
+                            finished = true
+                            return nil
+                        }
+                        emitRemaining = remaining - 1
+                    }
+                    return feature
+                }
+
+                if endReached {
                     finished = true
                     return nil
                 }
 
-                let colCount = sqlite3_column_count(stmt)
-                var row: [String: Sendable] = [:]
-                for i in 0 ..< colCount {
-                    guard let name = sqlite3_column_name(stmt, i).map({ String(cString: $0) }) else { continue }
-                    switch sqlite3_column_type(stmt, i) {
-                    case SQLITE_INTEGER:
-                        row[name] = Int(sqlite3_column_int64(stmt, i))
-                    case SQLITE_FLOAT:
-                        row[name] = sqlite3_column_double(stmt, i)
-                    case SQLITE_TEXT:
-                        if let text = sqlite3_column_text(stmt, i) {
-                            row[name] = String(cString: text)
-                        }
-                    case SQLITE_BLOB:
-                        if let bytes = sqlite3_column_blob(stmt, i) {
-                            let length = Int(sqlite3_column_bytes(stmt, i))
-                            row[name] = Data(bytes: bytes, count: length)
-                        }
-                    default:
-                        break
-                    }
+                // Buffer exhausted: fetch the next chunk of raw rows.
+                let query = metadata.selectSQL(
+                    boundingBox: boundingBox,
+                    useRTree: useRTree,
+                    limit: FeatureStream.chunkSize,
+                    offset: fetchOffset)
+                let rows = try database.db.query(
+                    query.sql, values: query.values)
+
+                fetchOffset += rows.count
+                buffered = try rows.map {
+                    try metadata.feature(from: $0)
                 }
+                bufferIndex = 0
 
-                guard let wkbData = row[geomColumnName] as? Data,
-                      let header = try? WKBHeader.parse(wkbData),
-                      let geoJson = try? WKBCoder.decode(wkb: header.wkbData, sourceSrid: header.srid)
-                else { continue }
-
-                let projection = GeoPackage.projection(for: srsId)
-                let projectedGeoJson = geoJson.projected(to: projection)
-
-                // Resolve the rowid / INTEGER PRIMARY KEY value. With
-                // `SELECT rowid, *` on a table that has an INTEGER PRIMARY KEY
-                // column (the spec-mandated `fid`), the first column is
-                // reported with the PK column's name (e.g. "fid") rather than
-                // "rowid", so look up several candidate keys. Prefer the
-                // explicit PK column, then fall back to `rowid`, then to `id`.
-                let gpkgRowId: Int? = {
-                    if let pk = pkColumnName, let v = row[pk] as? Int { return v }
-                    if let v = row["rowid"] as? Int { return v }
-                    if let v = row["id"] as? Int { return v }
+                if rows.isEmpty {
+                    finished = true
                     return nil
-                }()
-
-                // Promote the id/fid column value to the GeoJSON Feature.id
-                // based on the runtime SQLite cell type, so typed columns
-                // round-trip with type fidelity (INTEGER -> .int,
-                // REAL -> .double, TEXT -> .string).
-                let featureId: Feature.Identifier?
-                if let idColumnName, let raw = row[idColumnName] {
-                    switch raw {
-                    case let int as Int:
-                        featureId = .int(int)
-                    case let int64 as Int64:
-                        featureId = .int(Int(int64))
-                    case let double as Double:
-                        featureId = .double(double)
-                    case let string as String:
-                        featureId = .string(string)
-                    default:
-                        featureId = .string("\(raw)")
-                    }
                 }
-                else {
-                    featureId = nil
+                if rows.count < FeatureStream.chunkSize {
+                    // The next fetch would be empty. Drain this chunk and
+                    // finish without an extra database round trip.
+                    endReached = true
                 }
-
-                var properties: [String: Sendable] = [:]
-                for col in columnNames where col != geomColumnName
-                                            && col != idColumnName
-                                            && col != pkColumnName
-                {
-                    guard let value = row[col] else { continue }
-                    if let data = value as? Data {
-                        properties[col] = data.base64EncodedString()
-                    }
-                    else {
-                        properties[col] = value
-                    }
-                }
-
-                var feature = Feature(projectedGeoJson, id: featureId, properties: properties)
-                feature.gpkgTableName = table
-                feature.gpkgRowId = gpkgRowId
-
-                // In-memory bbox filter fallback for when rtree is unavailable
-                if let bbox = boundingBox, !feature.intersects(bbox) {
-                    continue
-                }
-
-                return feature
             }
         }
+
     }
 
 }

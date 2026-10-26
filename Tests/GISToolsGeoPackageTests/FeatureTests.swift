@@ -25,7 +25,7 @@ struct GeoPackageFeatureTests {
         #expect(read.features.count == 1)
         let readGeo = read.features[0].geometry
         #expect(readGeo is Point)
-        let point = readGeo as! Point
+        let point = try #require(readGeo as? Point)
         #expect(abs(point.coordinate.latitude - 45.0) < 0.000001)
         #expect(abs(point.coordinate.longitude - 10.0) < 0.000001)
     }

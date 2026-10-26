@@ -8,7 +8,7 @@ extension GeoPackage {
     /// - Parameter url: The file URL of a GeoPackage database.
     /// - Returns: A ``GeoPackageValidation`` result listing errors and warnings.
     public static func validate(url: URL) throws -> GeoPackageValidation {
-        let db = try SQLiteDB(path: url.path)
+        let db = try SQLiteDB(path: url.path, readOnly: true)
         defer { db.close() }
         return try validate(in: db)
     }
@@ -24,11 +24,41 @@ extension GeoPackage {
         validateCoreTables(allTables, errors: &errors, warnings: &warnings)
         try validateSrsTable(db, allTables: allTables, errors: &errors, warnings: &warnings)
 
-        let contentsRows = try readContentsRows(db, allTables: allTables)
-        try validateContentsTable(db, contentsRows: contentsRows, allTables: allTables, errors: &errors, warnings: &warnings)
+        // Reading gpkg_contents is only safe when its required columns exist.
+        // Malformed schemas are reported as structural errors instead of
+        // leaking an SQLite error.
+        let contentsReadable = try validateRequiredColumns(
+            "gpkg_contents",
+            columns: [
+                "table_name", "data_type", "identifier", "description",
+                "last_change", "min_x", "min_y", "max_x", "max_y", "srs_id",
+            ],
+            in: db,
+            errors: &errors)
+        let contentsRows = contentsReadable
+            ? try readContentsRows(db, allTables: allTables)
+            : []
+        try validateContentsTable(
+            db,
+            contentsRows: contentsRows,
+            allTables: allTables,
+            errors: &errors,
+            warnings: &warnings)
 
-        if allTables.contains("gpkg_geometry_columns") {
-            try validateGeometryColumns(db, contentsRows: contentsRows, errors: &errors, warnings: &warnings)
+        let geometryColumnsReadable = try validateRequiredColumns(
+            "gpkg_geometry_columns",
+            columns: [
+                "table_name", "column_name", "geometry_type_name",
+                "srs_id", "z", "m",
+            ],
+            in: db,
+            errors: &errors)
+        if geometryColumnsReadable {
+            try validateGeometryColumns(
+                db,
+                contentsRows: contentsRows,
+                errors: &errors,
+                warnings: &warnings)
         }
 
         let tileTables = contentsRows.filter { $0.dataType == "tiles" }
@@ -49,6 +79,51 @@ extension GeoPackage {
         let rows = try db.query(
             "SELECT name FROM sqlite_master WHERE type='table';")
         return Set(rows.compactMap { $0["name"] as? String })
+    }
+
+    /// Verifies that a table exists and contains all required columns.
+    ///
+    /// - Returns: `true` when the table exists and every required column is
+    ///   present, `false` otherwise.
+    private static func validateRequiredColumns(
+        _ table: String,
+        columns: [String],
+        in db: SQLiteDB,
+        errors: inout [GeoPackageValidationIssue]
+    ) throws -> Bool {
+        guard try GeoPackage.tableExists(table, in: db) else {
+            return false
+        }
+
+        let info = try db.query(
+            "PRAGMA table_info(\(GeoPackage.sanitizeIdentifier(table)));")
+        let existing = Set(info.compactMap {
+            ($0["name"] as? String)?.lowercased()
+        })
+
+        var valid = true
+        for column in columns where !existing.contains(column.lowercased()) {
+            errors.append(.missingRequiredColumn(table, column))
+            valid = false
+        }
+        return valid
+    }
+
+    /// Whether `gpkg_spatial_ref_sys.srs_id` can be queried safely.
+    ///
+    /// Structural errors in the SRS table are reported once by
+    /// ``validateSrsTable(_:allTables:errors:warnings:)``; reference checks
+    /// are skipped so validation returns diagnostics instead of an SQLite
+    /// error.
+    private static func srsTableIsReadable(_ db: SQLiteDB) throws -> Bool {
+        guard try GeoPackage.tableExists("gpkg_spatial_ref_sys", in: db) else {
+            return false
+        }
+        let info = try db.query("PRAGMA table_info(gpkg_spatial_ref_sys);")
+        return info.contains {
+            ($0["name"] as? String)?.caseInsensitiveCompare("srs_id")
+                == .orderedSame
+        }
     }
 
     private static func readContentsRows(_ db: SQLiteDB, allTables: Set<String>) throws -> [ContentsRow] {
@@ -103,10 +178,12 @@ extension GeoPackage {
         errors: inout [GeoPackageValidationIssue],
         warnings: inout [GeoPackageValidationIssue]
     ) {
-        for name in ["gpkg_spatial_ref_sys", "gpkg_contents"] {
-            if !allTables.contains(name) {
-                errors.append(.missingMandatoryTable(name))
-            }
+        for name in [
+            "gpkg_spatial_ref_sys",
+            "gpkg_contents",
+            "gpkg_geometry_columns",
+        ] where !allTables.contains(name) {
+            errors.append(.missingMandatoryTable(name))
         }
 
         if !allTables.contains("gpkg_extensions") {
@@ -122,17 +199,32 @@ extension GeoPackage {
     ) throws {
         guard allTables.contains("gpkg_spatial_ref_sys") else { return }
 
-        let requiredCols = ["srs_id", "srs_name", "organization",
-                            "organization_coordsys_id", "definition"]
-        let colInfo = try db.query("PRAGMA table_info(gpkg_spatial_ref_sys);")
-        let existingCols = Set(colInfo.compactMap { $0["name"] as? String })
-        for col in requiredCols where !existingCols.contains(col) {
-            errors.append(.missingRequiredColumn("gpkg_spatial_ref_sys", col))
-        }
+        let readable = try validateRequiredColumns(
+            "gpkg_spatial_ref_sys",
+            columns: [
+                "srs_id", "srs_name", "organization",
+                "organization_coordsys_id", "definition",
+            ],
+            in: db,
+            errors: &errors)
+        guard readable else { return }
 
         let count = try db.query("SELECT count(*) as cnt FROM gpkg_spatial_ref_sys;")
         if let first = count.first, (first["cnt"] as? Int ?? 0) == 0 {
             warnings.append(.emptySrsTable)
+            return
+        }
+
+        // Requirement 11 mandates these three rows. Missing rows are a
+        // warning rather than an error so older packages that predate the
+        // requirement can still be read and reported on.
+        for srsId in [4326, 0, -1] {
+            let rows = try db.query(
+                "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = ? LIMIT 1;",
+                values: [srsId])
+            if rows.isEmpty {
+                warnings.append(.missingSrsEntry(srsId))
+            }
         }
     }
 
@@ -146,7 +238,7 @@ extension GeoPackage {
         guard allTables.contains("gpkg_contents") else { return }
 
         if contentsRows.isEmpty {
-            warnings.append(.emptySrsTable)
+            warnings.append(.emptyContentsTable)
             return
         }
 
@@ -161,11 +253,14 @@ extension GeoPackage {
             if !allTables.contains(row.tableName) {
                 errors.append(.missingReferencedTable(row.tableName))
             }
-            if let srsId = row.srsId {
+            if let srsId = row.srsId,
+               try srsTableIsReadable(db)
+            {
                 let srsCheck = try db.query(
-                    "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = \(srsId) LIMIT 1;")
+                    "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = ? LIMIT 1;",
+                    values: [srsId])
                 if srsCheck.isEmpty {
-                    warnings.append(.invalidSrsReference(row.tableName, srsId))
+                    errors.append(.invalidSrsReference(row.tableName, srsId))
                 }
             }
         }
@@ -206,20 +301,38 @@ extension GeoPackage {
                 warnings.append(.invalidMValue(table, m))
             }
 
-            let srsCheck = try db.query(
-                "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = \(srsId) LIMIT 1;")
-            if srsCheck.isEmpty {
-                errors.append(.invalidSrsReference("gpkg_geometry_columns/\(table)", srsId))
+            if try srsTableIsReadable(db) {
+                let srsCheck = try db.query(
+                    "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = ? LIMIT 1;",
+                    values: [srsId])
+                if srsCheck.isEmpty {
+                    errors.append(.invalidSrsReference(
+                        "gpkg_geometry_columns/\(table)", srsId))
+                }
             }
 
-            if !contentsRows.contains(where: { $0.tableName == table }) {
-                warnings.append(.invalidStructure("gpkg_geometry_columns/\(table) not in gpkg_contents"))
+            if !contentsRows.contains(where: {
+                $0.tableName == table && $0.dataType == "features"
+            }) {
+                errors.append(.invalidStructure(
+                    "gpkg_geometry_columns/\(table) not in gpkg_contents"))
+            }
+
+            let columnName = col["column_name"] as? String ?? ""
+            let tableInfo = try db.query(
+                "PRAGMA table_info(\(GeoPackage.sanitizeIdentifier(table)));")
+            let tableColumns = Set(tableInfo.compactMap {
+                ($0["name"] as? String)?.lowercased()
+            })
+            if !tableColumns.contains(columnName.lowercased()) {
+                errors.append(.invalidStructure(
+                    "gpkg_geometry_columns/\(table).\(columnName) does not exist"))
             }
         }
 
         let featureTables = contentsRows.filter { $0.dataType == "features" }
         if !featureTables.isEmpty, geomCols.isEmpty {
-            warnings.append(.missingGeometryColumnsForFeatures)
+            errors.append(.missingGeometryColumnsForFeatures)
         }
     }
 
@@ -236,21 +349,64 @@ extension GeoPackage {
         if !allTables.contains("gpkg_tile_matrix") {
             errors.append(.missingTileMatrix)
         }
-        guard allTables.contains("gpkg_tile_matrix_set") else { return }
+
+        guard try validateRequiredColumns(
+            "gpkg_tile_matrix_set",
+            columns: ["table_name", "srs_id", "min_x", "min_y", "max_x", "max_y"],
+            in: db,
+            errors: &errors)
+        else { return }
+        guard try validateRequiredColumns(
+            "gpkg_tile_matrix",
+            columns: [
+                "table_name", "zoom_level", "matrix_width", "matrix_height",
+                "tile_width", "tile_height", "pixel_x_size", "pixel_y_size",
+            ],
+            in: db,
+            errors: &errors)
+        else { return }
 
         let tmsRows = try db.query("SELECT table_name, srs_id FROM gpkg_tile_matrix_set;")
         let tmsTables = Set(tmsRows.compactMap { $0["table_name"] as? String })
+
+        for row in tmsRows {
+            guard let name = row["table_name"] as? String,
+                  let srsId = row["srs_id"] as? Int
+            else { continue }
+            if try srsTableIsReadable(db) {
+                let srsCheck = try db.query(
+                    "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = ? LIMIT 1;",
+                    values: [srsId])
+                if srsCheck.isEmpty {
+                    errors.append(.invalidSrsReference(
+                        "tile_matrix_set/\(name)", srsId))
+                }
+            }
+        }
 
         for tileTable in tileTables {
             if !tmsTables.contains(tileTable.tableName) {
                 errors.append(.missingTileMatrixEntry(tileTable.tableName))
             }
-            if let srsId = tileTable.srsId {
+            if let srsId = tileTable.srsId,
+               try srsTableIsReadable(db)
+            {
                 let srsCheck = try db.query(
-                    "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = \(srsId) LIMIT 1;")
+                    "SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = ? LIMIT 1;",
+                    values: [srsId])
                 if srsCheck.isEmpty {
-                    warnings.append(.invalidSrsReference("tile/\(tileTable.tableName)", srsId))
+                    errors.append(.invalidSrsReference(
+                        "tile/\(tileTable.tableName)", srsId))
                 }
+            }
+
+            // Every tile table needs at least one gpkg_tile_matrix row.
+            let matrices = try db.query(
+                "SELECT 1 FROM gpkg_tile_matrix WHERE table_name = ? LIMIT 1;",
+                values: [tileTable.tableName])
+            if matrices.isEmpty {
+                warnings.append(.invalidStructure(
+                    "gpkg_tile_matrix has no rows for '\(tileTable.tableName)'"))
             }
         }
     }
@@ -260,6 +416,13 @@ extension GeoPackage {
         errors: inout [GeoPackageValidationIssue],
         warnings: inout [GeoPackageValidationIssue]
     ) throws {
+        guard try validateRequiredColumns(
+            "gpkg_extensions",
+            columns: ["extension_name", "scope"],
+            in: db,
+            errors: &errors)
+        else { return }
+
         let validScopes: Set<String> = ["read-write", "write-only"]
         let rows = try db.query("SELECT extension_name, scope FROM gpkg_extensions;")
 
