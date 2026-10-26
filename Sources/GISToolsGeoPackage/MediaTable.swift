@@ -45,4 +45,7 @@ public struct MediaTable: Sendable {
     /// The number of rows in the table.
     public var count: Int { rowIds.count }
 
+    /// Whether the table contains no rows.
+    public var isEmpty: Bool { count == 0 }
+
 }

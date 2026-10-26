@@ -48,9 +48,7 @@ struct GeoPackageValidationTests {
         let db = try SQLiteDB(path: url.path)
         try GeoPackage.createMetadata(in: db)
 
-        let bounds = BoundingBox(
-            southWest: Coordinate3D(latitude: -85.0, longitude: -180.0),
-            northEast: Coordinate3D(latitude: 85.0, longitude: 180.0))
+        let bounds = TestSupport.webMercatorWorld
         let matrices = [
             TileMatrix(tableName: "tiles",
                        zoomLevel: 0,

@@ -1,5 +1,4 @@
 import Foundation
-import OACSQLite
 import GISTools
 
 /// Writes tile (raster) data to a GeoPackage database.
@@ -17,7 +16,7 @@ enum TileWriter {
         let sanitized = GeoPackage.sanitizeIdentifier(tableName)
         try db.execute("""
             CREATE TABLE IF NOT EXISTS \(sanitized) (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
                 zoom_level INTEGER NOT NULL,
                 tile_column INTEGER NOT NULL,
                 tile_row INTEGER NOT NULL,
@@ -41,23 +40,13 @@ enum TileWriter {
         in db: SQLiteDB
     ) throws {
         let sanitized = GeoPackage.sanitizeIdentifier(tableName)
-        let sql = """
+        try db.execute(
+            """
             INSERT OR REPLACE INTO \(sanitized)
             (zoom_level, tile_column, tile_row, tile_data)
             VALUES (?, ?, ?, ?);
-            """
-        let stmt = try db.prepare(sql)
-        defer { sqlite3_finalize(stmt) }
-
-        try SQLiteDB.bind(stmt, index: 1, value: key.zoom)
-        try SQLiteDB.bind(stmt, index: 2, value: key.column)
-        try SQLiteDB.bind(stmt, index: 3, value: key.row)
-        try SQLiteDB.bind(stmt, index: 4, value: tileData)
-
-        let rc = sqlite3_step(stmt)
-        guard rc == SQLITE_DONE else {
-            throw GeoPackageError.sqliteError(detail: "Failed to insert tile: rc \(rc)")
-        }
+            """,
+            values: [key.zoom, key.column, key.row, tileData])
     }
 
     /// Writes a single tile blob using a MapTile (XYZ convention).
@@ -67,7 +56,7 @@ enum TileWriter {
     ///
     /// - Parameters:
     ///   - tileData: The raw PNG / JPEG / WebP tile data.
-    ///   - mapTile: The map tile in XYZ convention.
+    ///   - mapTile: The tile in XYZ convention.
     ///   - matrixHeight: The total number of tile rows at the tile's
     ///     zoom level.
     ///   - tableName: The target tile table name.
@@ -87,7 +76,9 @@ enum TileWriter {
     ///
     /// Creates the tile table, inserts all tile blobs, and writes
     /// `gpkg_contents`, `gpkg_tile_matrix_set` and `gpkg_tile_matrix`
-    /// metadata rows.
+    /// metadata rows inside one transaction. Existing rows and matrix entries
+    /// for the table are replaced. Invalid matrix or tile references leave
+    /// the database unchanged.
     ///
     /// - Parameters:
     ///   - tiles: Tile blobs keyed by (zoom, column, row) in TMS convention.
@@ -108,51 +99,178 @@ enum TileWriter {
         description: String? = nil,
         in db: SQLiteDB
     ) throws {
+        try GeoPackage.validateTableName(tableName)
+        try GeoPackage.ensureContentsDataType(
+            "tiles", for: tableName, in: db)
+
         guard !tiles.isEmpty else {
-            throw GeoPackageError.invalidGeoPackage(detail: 
-                "Tile pyramid must contain at least one tile")
+            throw GeoPackageError.invalidGeoPackage(
+                detail: "Tile pyramid must contain at least one tile")
+        }
+        guard !matrices.isEmpty else {
+            throw GeoPackageError.invalidGeoPackage(
+                detail: "Tile pyramid must contain at least one tile matrix")
+        }
+        let expectedProjection = GeoPackage.projection(for: srsId)
+        if matrixSetBounds.projection != .noSRID,
+           matrixSetBounds.projection != expectedProjection
+        {
+            throw GeoPackageError.invalidArgument(
+                detail: """
+                    Tile matrix set bounds use \(matrixSetBounds.projection), \
+                    but srsId \(srsId) resolves to \(expectedProjection)
+                    """)
         }
 
-        try createTileTable(tableName, in: db)
+        try validate(
+            tiles: tiles,
+            matrices: matrices,
+            tableName: tableName,
+            bounds: matrixSetBounds)
 
-        for (key, data) in tiles {
-            try write(tileData: data, for: key, to: tableName, in: db)
+        let ident = identifier ?? tableName
+        let desc = description ?? "tile table"
+        let bounds = matrixSetBounds
+
+        try db.withTransaction {
+            try GeoPackage.ensureSrsRow(srsId, in: db)
+            try createTileTable(tableName, in: db)
+
+            // A pyramid write replaces the table's previous contents and
+            // matrix rows so removed tiles/zoom levels do not linger.
+            try db.execute(
+                "DELETE FROM \(GeoPackage.sanitizeIdentifier(tableName));")
+            try db.execute(
+                "DELETE FROM gpkg_tile_matrix WHERE table_name = ?;",
+                values: [tableName])
+
+            for (key, data) in tiles {
+                try write(
+                    tileData: data,
+                    for: key,
+                    to: tableName,
+                    in: db)
+            }
+
+            try db.execute(
+                """
+                INSERT OR REPLACE INTO gpkg_contents
+                (table_name, data_type, identifier, description,
+                 last_change, min_x, min_y, max_x, max_y, srs_id)
+                VALUES (?, 'tiles', ?, ?,
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?, ?, ?, ?);
+                """,
+                values: [
+                    tableName,
+                    ident,
+                    desc,
+                    bounds.southWest.longitude,
+                    bounds.southWest.latitude,
+                    bounds.northEast.longitude,
+                    bounds.northEast.latitude,
+                    srsId,
+                ])
+
+            try db.execute(
+                """
+                INSERT OR REPLACE INTO gpkg_tile_matrix_set
+                (table_name, srs_id, min_x, min_y, max_x, max_y)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                values: [
+                    tableName,
+                    srsId,
+                    bounds.southWest.longitude,
+                    bounds.southWest.latitude,
+                    bounds.northEast.longitude,
+                    bounds.northEast.latitude,
+                ])
+
+            for matrix in matrices {
+                try db.execute(
+                    """
+                    INSERT OR REPLACE INTO gpkg_tile_matrix
+                    (table_name, zoom_level, matrix_width, matrix_height,
+                     tile_width, tile_height, pixel_x_size, pixel_y_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    values: [
+                        tableName,
+                        matrix.zoomLevel,
+                        matrix.matrixWidth,
+                        matrix.matrixHeight,
+                        matrix.tileWidth,
+                        matrix.tileHeight,
+                        matrix.pixelXSize,
+                        matrix.pixelYSize,
+                    ])
+            }
+        }
+    }
+
+    // MARK: - Validation
+
+    private static func validate(
+        tiles: [TileKey: Data],
+        matrices: [TileMatrix],
+        tableName: String,
+        bounds: BoundingBox
+    ) throws {
+        guard bounds.southWest.longitude.isFinite,
+              bounds.southWest.latitude.isFinite,
+              bounds.northEast.longitude.isFinite,
+              bounds.northEast.latitude.isFinite
+        else {
+            throw GeoPackageError.invalidArgument(
+                detail: "Tile matrix set bounds must be finite")
         }
 
-        let sanitized = GeoPackage.sanitizeStringLiteral(tableName)
-        let ident = identifier.map {
-            GeoPackage.sanitizeStringLiteral($0)
-        } ?? "NULL"
-        let desc = description.map {
-            GeoPackage.sanitizeStringLiteral($0)
-        } ?? "'tile table'"
+        var matrixByZoom: [Int: TileMatrix] = [:]
+        for matrix in matrices {
+            guard matrix.tableName == tableName else {
+                throw GeoPackageError.invalidArgument(
+                    detail: """
+                        Tile matrix for zoom \(matrix.zoomLevel) belongs to \
+                        '\(matrix.tableName)', not '\(tableName)'
+                        """)
+            }
+            guard matrixByZoom[matrix.zoomLevel] == nil else {
+                throw GeoPackageError.invalidArgument(
+                    detail: "Duplicate tile matrix for zoom \(matrix.zoomLevel)")
+            }
+            guard matrix.zoomLevel >= 0,
+                  matrix.matrixWidth > 0,
+                  matrix.matrixHeight > 0,
+                  matrix.tileWidth > 0,
+                  matrix.tileHeight > 0,
+                  matrix.pixelXSize > 0,
+                  matrix.pixelYSize > 0,
+                  matrix.pixelXSize.isFinite,
+                  matrix.pixelYSize.isFinite
+            else {
+                throw GeoPackageError.invalidArgument(
+                    detail: """
+                        Tile matrix for zoom \(matrix.zoomLevel) has invalid \
+                        dimensions or pixel sizes
+                        """)
+            }
+            matrixByZoom[matrix.zoomLevel] = matrix
+        }
 
-        try db.execute("""
-            INSERT OR REPLACE INTO gpkg_contents
-            (table_name, data_type, identifier, description,
-             min_x, min_y, max_x, max_y, srs_id)
-            VALUES (\(sanitized), 'tiles', \(ident), \(desc),
-            \(matrixSetBounds.southWest.longitude), \(matrixSetBounds.southWest.latitude),
-            \(matrixSetBounds.northEast.longitude), \(matrixSetBounds.northEast.latitude), \(srsId));
-            """)
-
-        try db.execute("""
-            INSERT OR REPLACE INTO gpkg_tile_matrix_set
-            (table_name, srs_id, min_x, min_y, max_x, max_y)
-            VALUES (\(sanitized), \(srsId),
-            \(matrixSetBounds.southWest.longitude), \(matrixSetBounds.southWest.latitude),
-            \(matrixSetBounds.northEast.longitude), \(matrixSetBounds.northEast.latitude));
-            """)
-
-        for m in matrices {
-            try db.execute("""
-                INSERT OR REPLACE INTO gpkg_tile_matrix
-                (table_name, zoom_level, matrix_width, matrix_height,
-                 tile_width, tile_height, pixel_x_size, pixel_y_size)
-                VALUES (\(sanitized), \(m.zoomLevel), \(m.matrixWidth),
-                \(m.matrixHeight), \(m.tileWidth), \(m.tileHeight),
-                \(m.pixelXSize), \(m.pixelYSize));
-                """)
+        for key in tiles.keys {
+            guard let matrix = matrixByZoom[key.zoom] else {
+                throw GeoPackageError.invalidArgument(
+                    detail: "Tile zoom \(key.zoom) has no tile matrix")
+            }
+            guard key.column >= 0, key.column < matrix.matrixWidth,
+                  key.row >= 0, key.row < matrix.matrixHeight
+            else {
+                throw GeoPackageError.invalidArgument(
+                    detail: """
+                        Tile \(key.zoom)/\(key.column)/\(key.row) is outside \
+                        the \(matrix.matrixWidth)x\(matrix.matrixHeight) matrix
+                        """)
+            }
         }
     }
 
