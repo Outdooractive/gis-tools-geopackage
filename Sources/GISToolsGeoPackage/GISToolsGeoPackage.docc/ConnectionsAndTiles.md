@@ -126,5 +126,8 @@ Web Mercator pyramid reports metres, not degrees.
 
 ## See also
 
-- <doc:FeatureTables>
-- <doc:ValidationAndRelationships>
+- [Feature tables and queries][featuretables]
+- [Validation, attribute tables and relationships][validationandrelationships]
+
+[featuretables]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/featuretables
+[validationandrelationships]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/validationandrelationships

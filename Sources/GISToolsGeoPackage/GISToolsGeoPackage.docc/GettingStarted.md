@@ -113,6 +113,10 @@ is used when present; otherwise the filter is applied after decoding.
 
 ## See also
 
-- <doc:FeatureTables>
-- <doc:ConnectionsAndTiles>
-- <doc:ValidationAndRelationships>
+- [Feature tables and queries][featuretables]
+- [Connections, streaming and tiles][connectionsandtiles]
+- [Validation, attribute tables and relationships][validationandrelationships]
+
+[featuretables]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/featuretables
+[connectionsandtiles]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/connectionsandtiles
+[validationandrelationships]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/validationandrelationships
