@@ -11,10 +11,10 @@ Add the package and its GISTools dependency to your `Package.swift`:
 dependencies: [
     .package(
         url: "https://github.com/Outdooractive/gis-tools-geopackage",
-        from: "1.0.0"),
+        from: "3.0.0"),
     .package(
         url: "https://github.com/Outdooractive/gis-tools",
-        exact: "3.0.0-beta.5"),
+        from: "3.0.0"),
 ],
 targets: [
     .target(name: "MyTarget", dependencies: [
