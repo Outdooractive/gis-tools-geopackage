@@ -6,6 +6,8 @@ semantic versioning.
 
 ## Unreleased
 
+## 3.0.0 - 2026-10-30
+
 ### Added
 
 - Synchronous `GeoPackageCoder.read(from:)` / `GeoPackageCoder.write(_:to:)`
@@ -27,7 +29,7 @@ semantic versioning.
 
 ### Changed
 
-- Updated `gis-tools` to `3.0.0-beta.5`.
+- Updated `gis-tools` to 3.0.0.
 - `noSRID` data is stored as GeoPackage SRS `0` instead of being silently
   labelled EPSG:4326. EPSG:4326 remains unchanged.
 - Features from different projections are reprojected into the table CRS

@@ -16,7 +16,7 @@ let package = Package(
             targets: ["GISToolsGeoPackage"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Outdooractive/gis-tools", exact: "3.0.0-beta.6"),
+        .package(url: "https://github.com/Outdooractive/gis-tools", from: "3.0.0"),
     ],
     targets: [
         .systemLibrary(

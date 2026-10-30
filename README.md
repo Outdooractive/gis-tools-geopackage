@@ -34,8 +34,8 @@ is available. It links the system SQLite library:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Outdooractive/gis-tools-geopackage", from: "1.0.0"),
-    .package(url: "https://github.com/Outdooractive/gis-tools", exact: "3.0.0-beta.5"),
+    .package(url: "https://github.com/Outdooractive/gis-tools-geopackage", from: "3.0.0"),
+    .package(url: "https://github.com/Outdooractive/gis-tools", from: "3.0.0"),
 ],
 targets: [
     .target(name: "MyTarget", dependencies: [
