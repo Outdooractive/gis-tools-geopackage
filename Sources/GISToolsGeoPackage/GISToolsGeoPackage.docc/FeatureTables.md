@@ -124,5 +124,8 @@ All rows of one call are written in a transaction. Geometry type conflicts
 
 ## See also
 
-- <doc:ConnectionsAndTiles>
-- <doc:ValidationAndRelationships>
+- [Connections, streaming and tiles][connectionsandtiles]
+- [Validation, attribute tables and relationships][validationandrelationships]
+
+[connectionsandtiles]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/connectionsandtiles
+[validationandrelationships]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/validationandrelationships

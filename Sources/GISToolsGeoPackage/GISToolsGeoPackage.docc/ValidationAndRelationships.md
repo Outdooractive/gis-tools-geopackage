@@ -131,6 +131,10 @@ extension or a matching relationship is absent they return an empty array.
 
 ## See also
 
-- <doc:GettingStarted>
-- <doc:FeatureTables>
-- <doc:ConnectionsAndTiles>
+- [Getting started][gettingstarted]
+- [Feature tables and queries][featuretables]
+- [Connections, streaming and tiles][connectionsandtiles]
+
+[gettingstarted]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/gettingstarted
+[featuretables]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/featuretables
+[connectionsandtiles]: https://swiftpackageindex.com/Outdooractive/gis-tools-geopackage/documentation/gistoolsgeopackage/connectionsandtiles
